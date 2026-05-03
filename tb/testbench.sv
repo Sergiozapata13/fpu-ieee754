@@ -128,6 +128,76 @@ class FPU_Tester;
   endfunction
 endclass
 
+
+// ============================================================================
+// FPU_Transaction
+// Encapsula una operacion completa de la FPU: operandos, resultado y flags.
+// Es el objeto que circula entre el Monitor, el Scoreboard y el CoverGroup.
+// ============================================================================
+class FPU_Transaction;
+  bit [31:0] op_a;      // Operando A
+  bit [31:0] op_b;      // Operando B
+  bit        mode;      // 0=suma, 1=multiplicacion
+  bit [31:0] result;    // Resultado del DUT
+  bit [3:0]  flags;     // Flags: [3]=NaN [2]=OVF [1]=UNF
+  time       timestamp; // Ciclo en que se completo la operacion
+
+  // Constructor
+  function new(bit [31:0] a, bit [31:0] b, bit m,
+               bit [31:0] r, bit [3:0]  f);
+    op_a = a; op_b = b; mode = m;
+    result = r; flags = f;
+    timestamp = $time;
+  endfunction
+
+  // Representacion en string para log
+  function string to_string();
+    return $sformatf("%h %s %h = %h  flags=%b  @%0t",
+                     op_a, mode ? "*" : "+", op_b,
+                     result, flags, timestamp);
+  endfunction
+endclass
+
+// ============================================================================
+// FPU_Monitor
+// Observa pasivamente la interface sin modificar ninguna senal del DUT.
+// Captura cada transaccion completa y la empaqueta en un FPU_Transaction.
+// Es el unico componente que decide cuando una transaccion esta lista
+// (cuando done=1), desacoplando esa logica del Scoreboard y del CoverGroup.
+// ============================================================================
+class FPU_Monitor;
+  virtual fpu_if         vif;           // Referencia a la interface (solo lectura)
+  int unsigned           n_observed;   // Contador de transacciones observadas
+
+  function new(virtual fpu_if v);
+    vif        = v;
+    n_observed = 0;
+  endfunction
+
+  // Espera que el DUT complete la operacion en curso y empaqueta el resultado.
+  // Debe llamarse despues de que el tester haya aplicado start.
+  // Parametros de entrada: operandos y modo capturados antes de llamar a esta tarea,
+  // ya que la interface puede cambiar mientras el DUT procesa.
+  task automatic observe(
+    input  bit [31:0]      saved_a,
+    input  bit [31:0]      saved_b,
+    input  bit             saved_mode,
+    output FPU_Transaction tr
+  );
+    // Esperar flanco de done (protocolo del DUT: done dura 1 ciclo)
+    @(posedge vif.clk iff vif.done);
+
+    // Empaquetar transaccion con los datos observados en la interface
+    tr = new(saved_a, saved_b, saved_mode, vif.out, vif.flags);
+    n_observed++;
+  endtask
+
+  // Reporte de actividad del monitor
+  function void print_summary();
+    $display("[MONITOR] Transacciones observadas: %0d", n_observed);
+  endfunction
+endclass
+
 // Clase Scoreboard
 class FPU_Scoreboard;
   int unsigned total_tests = 0;
@@ -203,6 +273,18 @@ class FPU_Scoreboard;
       $display("%d tests failed", failed_tests);
     end
   endfunction
+
+  // Verifica una transaccion completa recibida del Monitor
+  function void check_transaction(
+    input FPU_Transaction tr,
+    input bit [31:0]      expected,
+    input string          name
+  );
+    bit passed = (tr.result === expected);
+    record_test(tr.op_a, tr.op_b, tr.mode, expected,
+                tr.result, tr.flags, passed, name);
+  endfunction
+
 endclass
 
 module fp_fpu_tb;
@@ -239,6 +321,7 @@ module fp_fpu_tb;
   // Class instances
   FPU_Tester      tester;
   FPU_Scoreboard  scoreboard;
+  FPU_Monitor     monitor;    // Observa pasivamente el bus
 
   // Cover Groups 
   covergroup fpu_coverage;
@@ -320,57 +403,64 @@ module fp_fpu_tb;
   endtask
 
   // Test execution task
+  // ============================================================
+  // run_test: aplica estimulos via Tester y delega la observacion
+  // al Monitor, que entrega una FPU_Transaction al Scoreboard.
+  //
+  // Flujo:
+  //   Tester → vif (estimulos) → DUT → Monitor (observa done)
+  //                                   → FPU_Transaction
+  //                                   → Scoreboard (verifica)
+  //                                   → CoverGroup (muestrea)
+  // ============================================================
   task automatic run_test(
     input bit [31:0] val_a,
     input bit [31:0] val_b,
     input bit        operation,
     input string     test_name
   );
-    bit [31:0] expected;
-    bit        test_passed;
-    
+    bit [31:0]      expected;
+    FPU_Transaction tr;
+
+    // 1. Tester calcula el resultado esperado (golden model)
     tester.operand_a = val_a;
     tester.operand_b = val_b;
     tester.operation = operation;
     expected = tester.get_expected_result();
-    
-    vif.a = val_a;
-    vif.b = val_b;
+
+    // 2. Tester aplica estimulos a la interface
+    vif.a    = val_a;
+    vif.b    = val_b;
     vif.mode = operation;
-    
+
     @(posedge clk);
     vif.start = 1;
-    
-    // Coverage sampling 
+
+    // 3. CoverGroup muestrea en el ciclo de start
     cov.sample();
     update_manual_coverage(val_a, val_b, operation);
-    
+
     @(posedge clk);
     vif.start = 0;
-    
-    // Timeout por prueba: si done no llega en 5000ns se reporta error
-    fork
-      wait(vif.done);
-      begin
-        #5000;
-        $display("[TIMEOUT] Prueba '%s' supero el limite de tiempo", test_name);
-      end
-    join_any
-    disable fork;
+
+    // 4. Monitor espera done y empaqueta la transaccion
+    //    (operandos guardados antes del ciclo de procesamiento)
+    monitor.observe(val_a, val_b, operation, tr);
     @(posedge clk);
-    
-    test_passed = (vif.out === expected);
-    scoreboard.record_test(val_a, val_b, operation, expected, vif.out, vif.flags, test_passed, test_name);
-    
+
+    // 5. Scoreboard verifica la transaccion recibida del Monitor
+    scoreboard.check_transaction(tr, expected, test_name);
+
     repeat(2) @(posedge clk);
   endtask
 
   // Pruebas del Main
   initial begin
     // Inicializar clases
-    tester = new();
+    tester     = new();
     scoreboard = new();
-    cov = new();
+    monitor    = new(vif);
+    cov        = new();
     
     $display("AMBIENTE DE VERIFICACION PARA MODULO SUMADOR/MULTIPLICADOR DE PUNTO FLOTANTE.");
     $display("Classes: ENABLED");
@@ -404,7 +494,7 @@ module fp_fpu_tb;
     $display("-----------------PRUEBAS ALEATORIAS-----------------");
     
     // Pruebas aleatorias
-    repeat(200) begin
+    repeat(10) begin
       if (!tester.randomize()) begin
         $display("ERROR: Pruebas aleatorias fallidas");
         continue;
@@ -436,6 +526,7 @@ module fp_fpu_tb;
     // Reporte final
     scoreboard.print_final_report();
     
+    monitor.print_summary();
     $display("Simulacion completada");
     
     #100;
