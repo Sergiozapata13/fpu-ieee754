@@ -83,34 +83,101 @@ FSM: `IDLE → UNPACK → ALIGN → ADD_SUB → NORMALIZE → PACK`
 
 ## Ambiente de Verificación (`tb/testbench.sv`)
 
-Implementa un ambiente modular en SystemVerilog usando las features avanzadas del lenguaje.
+Implementa un ambiente modular en SystemVerilog siguiendo el patrón estándar de la industria (UVM-like), con separación clara de responsabilidades entre componentes.
+
+### Diagrama del ambiente
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                      fp_fpu_tb (Top)                         │
+│                                                              │
+│  ┌─────────────────┐       ┌──────────────────────────────┐  │
+│  │   FPU_Tester    │──────▶│         fpu_if               │  │
+│  │                 │       │   (Interface tipada con       │  │
+│  │ rand operand_a  │       │    modports tb / dut)         │  │
+│  │ rand operand_b  │       └────────────┬─────────────┬───┘  │
+│  │ constraint {...} │                   │ estímulos   │ done  │
+│  │ get_expected()  │              ┌─────▼─────┐       │      │
+│  └─────────────────┘              │  fp_fpu   │       │      │
+│                                   │   (DUT)   │       │      │
+│  ┌─────────────────┐              └─────┬─────┘       │      │
+│  │  FPU_Monitor    │◀────────────────────────────────┘      │
+│  │                 │   observa done + resultado              │
+│  │ observe()       │                                         │
+│  └────────┬────────┘                                         │
+│           │ FPU_Transaction                                  │
+│           │ {op_a, op_b, mode,                               │
+│           │  result, flags, timestamp}                       │
+│           │                                                  │
+│  ┌────────▼────────┐      ┌──────────────────────────────┐  │
+│  │ FPU_Scoreboard  │      │       fpu_coverage           │  │
+│  │                 │      │                              │  │
+│  │ check_          │      │  cp_operation  cp_sign_a     │  │
+│  │ transaction()   │      │  cp_sign_b     cp_special    │  │
+│  │ golden model    │      │  cross_op_signs              │  │
+│  │ → log file      │      └──────────────────────────────┘  │
+│  └─────────────────┘                                         │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Flujo de datos
+
+```
+Tester ──▶ fpu_if ──▶ DUT ──▶ Monitor ──▶ FPU_Transaction ──▶ Scoreboard
+                              (done)                       └──▶ CoverGroup
+```
 
 ### `fpu_if` — Interface
-Bus tipado con modports `tb` y `dut` que centraliza las señales entre el tester y el DUT.
+Bus tipado con modports `tb` y `dut` que centraliza todas las señales entre el tester y el DUT. Punto único de conexión que facilita cambios de protocolo.
+
+### `FPU_Transaction` — Clase de datos
+Encapsula una operación completa de la FPU. Es el objeto que circula entre Monitor, Scoreboard y CoverGroup, desacoplando la observación del bus de la verificación.
+
+```systemverilog
+class FPU_Transaction;
+  bit [31:0] op_a, op_b, result;
+  bit        mode;
+  bit [3:0]  flags;
+  time       timestamp;
+  function string to_string();
+endclass
+```
 
 ### `FPU_Tester` — Clase con randomización
+Genera estímulos aleatorios con constraints y calcula el resultado esperado mediante el golden model nativo del simulador.
+
 ```systemverilog
 class FPU_Tester;
   rand bit [31:0] operand_a, operand_b;
   rand bit        operation;
   constraint valid_test_cases { ... }  // 60% normales, 20% especiales, 20% conocidos
   static function bit is_special_case(...);
+  function bit [31:0] get_expected_result();  // usa $bitstoshortreal
+endclass
+```
+
+### `FPU_Monitor` — Clase de observación pasiva
+Observa la interface sin modificar ninguna señal. Detecta cuando `done=1`, empaqueta el resultado en un `FPU_Transaction` y lo entrega al Scoreboard. Es el único componente que conoce el protocolo de finalización del DUT.
+
+```systemverilog
+class FPU_Monitor;
+  virtual fpu_if vif;
+  task automatic observe(input bit [31:0] a, b, input bit mode,
+                         output FPU_Transaction tr);
 endclass
 ```
 
 ### `FPU_Scoreboard` — Clase con golden model
-- Golden model nativo usando `$bitstoshortreal` / `$shortrealtobits`
-- Comparación exacta bit-a-bit
-- Generación de log y estadísticas por tipo de operación
+Recibe `FPU_Transaction` del Monitor, compara con el valor esperado del Tester y registra PASS/FAIL. Genera el archivo de log y el reporte final.
 
-### `cg_fpu_coverage` — Covergroup
+### `fpu_coverage` — Covergroup
 ```systemverilog
-covergroup cg_fpu_coverage @(posedge clk);
-    cp_operation: coverpoint mode;
-    cp_sign_a:    coverpoint a[31];
-    cp_sign_b:    coverpoint b[31];
-    cp_special:   coverpoint is_special;
-    cx_op_sign:   cross cp_operation, cp_sign_a, cp_sign_b;
+covergroup fpu_coverage;
+    cp_operation: coverpoint vif.mode iff (vif.start);
+    cp_sign_a:    coverpoint vif.a[31] iff (vif.start);
+    cp_sign_b:    coverpoint vif.b[31] iff (vif.start);
+    cp_exp_a/b:   coverpoint exp { bins zero, normal, special, others }
+    cross_op_signs: cross cp_operation, cp_sign_a, cp_sign_b;
 endgroup
 ```
 
