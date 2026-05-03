@@ -1,0 +1,7 @@
+# Binarios compilados
+sim/
+*.out
+# Archivos generados por simulacion
+*.vcd
+*.log
+*.acdb
